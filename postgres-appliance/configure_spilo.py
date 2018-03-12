@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 
 import argparse
+import distutils.dir_util
 import logging
 import re
 import os
@@ -27,7 +28,7 @@ MEMORY_LIMIT_IN_BYTES_PATH = '/sys/fs/cgroup/memory/memory.limit_in_bytes'
 
 
 def parse_args():
-    sections = ['all', 'patroni', 'patronictl', 'certificate', 'wal-e', 'crontab',
+    sections = ['all', 'wal-e', 'patroni', 'patronictl', 'certificate', 'crontab',
                 'pam-oauth2', 'pgbouncer', 'bootstrap']
     argp = argparse.ArgumentParser(description='Configures Spilo',
                                    epilog="Choose from the following sections:\n\t{}".format('\n\t'.join(sections)),
@@ -43,7 +44,8 @@ def parse_args():
     if 'all' in args['sections']:
         args['sections'] = sections
         args['sections'].remove('all')
-    args['sections'] = set(args['sections'])
+    else:
+        args['sections'] = set(args['sections'])
 
     return args
 
@@ -225,7 +227,7 @@ postgresql:
 
   {{#USE_WALE}}
   recovery_conf:
-    restore_command: envdir "{{WALE_ENV_DIR}}" /wale_restore_command.sh "%f" "%p"
+    restore_command: {{{RESTORE_COMMAND}}}
   {{/USE_WALE}}
   authentication:
     superuser:
@@ -366,6 +368,7 @@ def get_placeholders(provider):
     placeholders.setdefault('WAL_BUCKET_SCOPE_SUFFIX', '')
     placeholders.setdefault('WALE_ENV_DIR', os.path.join(placeholders['PGHOME'], 'etc', 'wal-e.d', 'env'))
     placeholders.setdefault('USE_WALE', False)
+    placeholders.setdefault('RESTORE_COMMAND', '')
     placeholders.setdefault('PAM_OAUTH2', '')
     placeholders.setdefault('CALLBACK_SCRIPT', '')
     placeholders.setdefault('DCS_ENABLE_KUBERNETES_API', '')
@@ -515,6 +518,17 @@ def write_wale_environment(placeholders, provider, prefix, overwrite):
 
     write_file(placeholders['WALE_TMPDIR'], os.path.join(wale['WALE_ENV_DIR'], 'TMPDIR'), True)
 
+    if prefix:
+        return
+
+    if wale['WAL_BUCKET_SCOPE_SUFFIX'] and wale.get('WAL_S3_BUCKET'):
+        distutils.dir_util.copy_tree(wale['WALE_ENV_DIR'], wale['WALE_ENV_DIR'] + '-fallback')
+        write_file('s3://{WAL_S3_BUCKET}/spilo/{WAL_BUCKET_SCOPE_PREFIX}{SCOPE}/wal/'.format(**wale),
+                   os.path.join(wale['WALE_ENV_DIR'] + '-fallback', 'WALE_S3_PREFIX'), True)
+        placeholders['RESTORE_COMMAND'] = 'envdir "{WALE_ENV_DIR}" /wale_restore_command.sh "%f" "%p" || envdir "{WALE_ENV_DIR}-fallback" /wale_restore_command.sh "%f" "%p"'.format(**wale)
+    else:
+        placeholders['RESTORE_COMMAND'] = 'envdir "{WALE_ENV_DIR}" /wale_restore_command.sh "%f" "%p"'.format(**wale)
+
 
 def write_bootstrap_configuration(placeholders, provider, overwrite):
     if placeholders['CLONE_WITH_WALE']:
@@ -634,27 +648,28 @@ def main():
             'ETCD_DISCOVERY_DOMAIN' not in placeholders):
         write_etcd_configuration(placeholders)
 
-    config = yaml.load(pystache_render(TEMPLATE, placeholders))
-    config.update(get_dcs_config(config, placeholders))
-
-    user_config = yaml.load(os.environ.get('SPILO_CONFIGURATION', os.environ.get('PATRONI_CONFIGURATION', ''))) or {}
-    if not isinstance(user_config, dict):
-        config_var_name = 'SPILO_CONFIGURATION' if 'SPILO_CONFIGURATION' in os.environ else 'PATRONI_CONFIGURATION'
-        raise ValueError('{0} should contain a dict, yet it is a {1}'.format(config_var_name, type(user_config)))
-
-    config = deep_update(user_config, config)
-
-    # Ensure replication is available
-    if 'pg_hba' in config['bootstrap'] and not any(['replication' in i for i in config['bootstrap']['pg_hba']]):
-        rep_hba = 'hostssl replication {} 0.0.0.0/0 md5'.\
-            format(config['postgresql']['authentication']['replication']['username'])
-        config['bootstrap']['pg_hba'].insert(0, rep_hba)
 
     patroni_configfile = os.path.join(placeholders['PGHOME'], 'postgres.yml')
 
     for section in args['sections']:
         logging.info('Configuring {}'.format(section))
         if section == 'patroni':
+            config = yaml.load(pystache_render(TEMPLATE, placeholders))
+            config.update(get_dcs_config(config, placeholders))
+
+            user_config = yaml.load(os.environ.get('SPILO_CONFIGURATION', os.environ.get('PATRONI_CONFIGURATION', ''))) or {}
+            if not isinstance(user_config, dict):
+                config_var_name = 'SPILO_CONFIGURATION' if 'SPILO_CONFIGURATION' in os.environ else 'PATRONI_CONFIGURATION'
+                raise ValueError('{0} should contain a dict, yet it is a {1}'.format(config_var_name, type(user_config)))
+
+            config = deep_update(user_config, config)
+
+            # Ensure replication is available
+            if 'pg_hba' in config['bootstrap'] and not any(['replication' in i for i in config['bootstrap']['pg_hba']]):
+                rep_hba = 'hostssl replication {} 0.0.0.0/0 md5'.\
+                    format(config['postgresql']['authentication']['replication']['username'])
+                config['bootstrap']['pg_hba'].insert(0, rep_hba)
+
             write_file(yaml.dump(config, default_flow_style=False, width=120), patroni_configfile, args['force'])
         elif section == 'patronictl':
             configdir = os.path.join(placeholders['PGHOME'], '.config', 'patroni')
